@@ -95,7 +95,10 @@ def test_ap242_nested_repeated_assembly_preserves_rotated_occurrences(tmp_path, 
     shapes = XCAFDoc_DocumentTool.ShapeTool_s(doc.Main())
     part = shapes.AddShape(BRepPrimAPI_MakeBox(2., 4., 6.).Shape(), False)
     subassembly = shapes.NewShape()
-    shapes.AddComponent(subassembly, part, _translation(10., 0., 0.))
+    inner = gp_Trsf()
+    inner.SetRotation(gp_Ax1(gp_Pnt(0., 0., 0.), gp_Dir(1., 0., 0.)), math.pi / 2)
+    inner.SetTranslationPart(gp_Vec(10., 0., 0.))
+    shapes.AddComponent(subassembly, part, TopLoc_Location(inner))
     shapes.AddComponent(subassembly, part, _translation(20., 0., 0.))
     root = shapes.NewShape()
     TDataStd_Name.Set_s(root, TCollection_ExtendedString("Repeated rotated assembly"))
@@ -121,18 +124,48 @@ def test_ap242_nested_repeated_assembly_preserves_rotated_occurrences(tmp_path, 
         assert tool.GetReferredShape_s(component, label) and tool.IsAssembly_s(label)
     assert referred[0].IsEqual(referred[1])  # one definition, two occurrences
 
+    children = NCollection_Sequence[TDF_Label]()
+    assert tool.GetComponents_s(referred[0], children) and children.Length() == 2
+    parts = [TDF_Label(), TDF_Label()]
+    for child, label in zip(children, parts):
+        assert tool.GetReferredShape_s(child, label) and tool.IsSimpleShape_s(label)
+    assert parts[0].IsEqual(parts[1])  # the leaves also share one definition
+
+    # Numeric matrices are independent of OCCT's transform-composition implementation.
+    for labels, expected in (
+        (components, [((0., -1., 0., 100.), (1., 0., 0., 0.), (0., 0., 1., 0.)),
+                      ((1., 0., 0., 0.), (0., 1., 0., 100.), (0., 0., 1., 0.))]),
+        (children, [((1., 0., 0., 10.), (0., 0., -1., 0.), (0., 1., 0., 0.)),
+                    ((1., 0., 0., 20.), (0., 1., 0., 0.), (0., 0., 1., 0.))]),
+    ):
+        actual = []
+        for label in labels:
+            transform = tool.GetLocation_s(label).Transformation()
+            actual.append(tuple(transform.Value(row, col) for row in range(1, 4) for col in range(1, 5)))
+        for matrix, reference in zip(sorted(actual), sorted(tuple(v for row in m for v in row) for m in expected)):
+            assert matrix == pytest.approx(reference, abs=1e-7)
+
     centres = []
     volumes = []
+    inertias = []
     for solid in TopExp_Explorer(tool.GetShape_s(root_label), TopAbs_SOLID):
         props = GProp_GProps()
         BRepGProp.VolumeProperties_s(solid, props)
         centre = props.CentreOfMass()
         centres.append((centre.X(), centre.Y(), centre.Z()))
         volumes.append(props.Mass())
+        inertia = props.MatrixOfInertia()
+        inertias.append(tuple(inertia.Value(i, i) for i in range(1, 4)))
     assert len(centres) == 4
     assert volumes == pytest.approx([48.] * 4)
-    for actual, expected in zip(sorted(centres), [(11., 102., 3.), (21., 102., 3.), (98., 11., 3.), (98., 21., 3.)]):
+    for (actual, inertia), (expected, diagonal) in zip(sorted(zip(centres, inertias)), [
+        ((11., 97., 2.), (208., 80., 160.)),
+        ((21., 102., 3.), (208., 160., 80.)),
+        ((98., 21., 3.), (160., 208., 80.)),
+        ((103., 11., 2.), (80., 208., 160.)),
+    ]):
         assert actual == pytest.approx(expected, abs=1e-7)
+        assert inertia == pytest.approx(diagonal, abs=1e-7)
 
 
 def test_ap242_semantic_dimension_and_tolerance_keep_subshape_links(tmp_path, documents):
@@ -140,6 +173,9 @@ def test_ap242_semantic_dimension_and_tolerance_keep_subshape_links(tmp_path, do
     shapes = XCAFDoc_DocumentTool.ShapeTool_s(doc.Main())
     cylinder = BRepPrimAPI_MakeCylinder(2., 6.).Shape()
     part = shapes.AddShape(cylinder, False)
+    TDataStd_Name.Set_s(part, TCollection_ExtendedString("PMI target"))
+    # Same lateral area (24*pi), different radius, height and position: area alone cannot identify the target.
+    shapes.AddShape(BRepPrimAPI_MakeCylinder(1., 12.).Shape().Moved(_translation(20., 0., 0.)), False)
     face = next(Face(item) for item in TopExp_Explorer(cylinder, TopAbs_FACE)
                 if BRepAdaptor_Surface(Face(item)).GetType() == GeomAbs_Cylinder)
     face_label = shapes.AddSubShape(part, face)
@@ -168,20 +204,44 @@ def test_ap242_semantic_dimension_and_tolerance_keep_subshape_links(tmp_path, do
     found, attribute = dimensions.Value(1).FindAttribute(XCAFDoc_Dimension.GetID_s())
     assert found
     dim = attribute.GetObject()
-    assert dim.GetType() == dimension.GetType()
+    assert dim.GetType() == XCAFDimTolObjects_DimensionType.XCAFDimTolObjects_DimensionType_Size_Diameter
     assert dim.GetValue() == pytest.approx(4.)
     assert dim.GetUpperTolValue() == pytest.approx(.1)
     assert dim.GetLowerTolValue() == pytest.approx(.02)
     found, attribute = geometric.Value(1).FindAttribute(XCAFDoc_GeomTolerance.GetID_s())
     assert found
     geom = attribute.GetObject()
-    assert geom.GetType() == tolerance.GetType() and geom.GetValue() == pytest.approx(.05)
+    assert geom.GetType() == XCAFDimTolObjects_GeomToleranceType.XCAFDimTolObjects_GeomToleranceType_Cylindricity
+    assert geom.GetValue() == pytest.approx(.05)
+    shape_tool = XCAFDoc_DocumentTool.ShapeTool_s(loaded.Main())
+    roots = NCollection_Sequence[TDF_Label]()
+    shape_tool.GetFreeShapes(roots)
+    assert roots.Length() == 2
+    target = None
+    for root in roots:
+        found, name = root.FindAttribute(TDataStd_Name.GetID_s())
+        if found and name.Get().ToExtString() == "PMI target":
+            assert target is None
+            target = root
+    assert target is not None
+    expected_face = next(Face(item) for item in TopExp_Explorer(shape_tool.GetShape_s(target), TopAbs_FACE)
+                         if BRepAdaptor_Surface(Face(item)).GetType() == GeomAbs_Cylinder)
+    references = []
     for label in (dimensions.Value(1), geometric.Value(1)):
         first, second = NCollection_Sequence[TDF_Label](), NCollection_Sequence[TDF_Label]()
         assert XCAFDoc_DimTolTool.GetRefShapeLabel_s(label, first, second)
         assert first.Length() == 1 and second.Length() == 0
-        linked = XCAFDoc_DocumentTool.ShapeTool_s(loaded.Main()).GetShape_s(first.Value(1))
+        references.append(first.Value(1))
+        assert shape_tool.IsSubShape_s(first.Value(1))
+        linked = shape_tool.GetShape_s(first.Value(1))
         assert linked.ShapeType() == TopAbs_FACE
+        assert shape_tool.IsSubShape(target, linked) and linked.IsSame(expected_face)
+        surface = BRepAdaptor_Surface(Face(linked))
+        assert surface.GetType() == GeomAbs_Cylinder
+        assert surface.Cylinder().Radius() == pytest.approx(2.)
         props = GProp_GProps()
         BRepGProp.SurfaceProperties_s(linked, props)
         assert props.Mass() == pytest.approx(24 * math.pi)
+        centre = props.CentreOfMass()
+        assert (centre.X(), centre.Y(), centre.Z()) == pytest.approx((0., 0., 3.), abs=1e-7)
+    assert references[0].IsEqual(references[1])
